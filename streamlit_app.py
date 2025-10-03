@@ -129,4 +129,164 @@ def fmt_usd(x):
 def build_metrics_payload():
     payload = {
         "as_of_utc": as_of,
-        "window_hours": int(windo_
+        "window_hours": int(window_hours),
+        "totals": {}
+    }
+    if kpi_volume is not None:
+        payload["totals"]["volume_usd"] = round(kpi_volume, 2)
+    if kpi_swaps is not None:
+        payload["totals"]["swaps"] = int(kpi_swaps)
+    if kpi_traders is not None:
+        payload["totals"]["unique_traders"] = int(kpi_traders)
+
+    # by_chain_version (only if all needed cols present)
+    if chain_col and version_col and vol_col:
+        bc = (
+            view.groupby([chain_col, version_col])[vol_col]
+            .sum().reset_index()
+            .rename(columns={chain_col: "chain", version_col: "version", vol_col: "volume_usd"})
+            .to_dict(orient="records")
+        )
+        payload["by_chain_version"] = bc
+
+    # top_pools (if pool label + vol exist)
+    pool_label = "pool_or_pair" if "pool_or_pair" in view.columns else (
+        "token_symbol" if "token_symbol" in view.columns else ("pool" if "pool" in view.columns else None)
+    )
+    if pool_label and vol_col:
+        top = (
+            view.groupby(pool_label)[vol_col]
+            .sum().reset_index()
+            .sort_values(vol_col, ascending=False)
+            .head(5)
+            .rename(columns={pool_label: "pool_or_pair", vol_col: "volume_usd"})
+            .to_dict(orient="records")
+        )
+        payload["top_pools"] = top
+
+    return payload
+
+def render_digest_md(d):
+    # Turn the structured digest into nice markdown (no code block)
+    headline = d.get("headline", "Uniswap activity update")
+    bullets  = d.get("bullets", [])
+    watch    = d.get("watch_next", "")
+    md = f"### {headline}\n\n"
+    for b in bullets:
+        md += f"- {b}\n"
+    if watch:
+        md += f"\n**What to watch next:** {watch}\n"
+    return md
+
+def fallback_digest_md():
+    parts = [f"### Uniswap activity update (last {int(window_hours)}h)"]
+    totals = []
+    if kpi_volume is not None:  totals.append(f"Volume: {fmt_usd(kpi_volume)}")
+    if kpi_swaps is not None:   totals.append(f"Swaps: {kpi_swaps:,}")
+    if kpi_traders is not None: totals.append(f"Unique traders: {kpi_traders:,}")
+    if totals:
+        parts.append("- " + " • ".join(totals))
+    if chain_col and version_col and vol_col:
+        parts.append("- See breakdown by chain/version below.")
+    parts.append("- Top pools shown in the chart below.")
+    parts.append("**What to watch next:** monitor unusual deltas vs prior window.")
+    return "\n".join(parts)
+
+use_llm = st.sidebar.checkbox("Use OpenAI (if key set)", value=True)
+
+rendered_md = fallback_digest_md()
+if use_llm and "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        metrics = build_metrics_payload()
+
+        # Ask for STRUCTURED OUTPUT to keep it clean and consistent
+        schema = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "uniswap_digest",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "headline": {"type": "string"},
+                        "bullets":  {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4},
+                        "watch_next": {"type": "string"}
+                    },
+                    "required": ["headline", "bullets"],
+                    "additionalProperties": False
+                }
+            }
+        }
+
+        prompt = f"""You are a product-minded analyst. Using ONLY the JSON below, produce a short Uniswap digest for the last {int(window_hours)} hours.
+Return JSON with fields: headline, bullets (2–4 items), watch_next (optional).
+Keep it factual; do not invent numbers. Use units (USD, %, hours) where relevant.
+
+JSON:
+{json.dumps(metrics)}
+"""
+
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=prompt,
+            response_format=schema
+        )
+
+        # Parse the model's JSON output safely
+        dig = None
+        try:
+            dig = json.loads(resp.output_text)
+        except Exception:
+            pass
+
+        if isinstance(dig, dict):
+            rendered_md = render_digest_md(dig)
+        else:
+            rendered_md = fallback_digest_md()
+
+    except Exception as e:
+        st.warning(f"LLM disabled (error: {e}). Showing fallback.")
+        rendered_md = fallback_digest_md()
+
+# Render the digest as normal markdown (NOT a code block)
+st.markdown(rendered_md)
+
+# ---------- KPI strip (only show what’s real) ----------
+st.markdown("---")
+cols = []
+if kpi_volume is not None:  cols.append(("Volume (USD, window)", fmt_usd(kpi_volume)))
+if kpi_swaps  is not None:  cols.append(("Swaps (window)", f"{kpi_swaps:,}"))
+if kpi_traders is not None: cols.append(("Unique traders (window)", f"{kpi_traders:,}"))
+
+if cols:
+    cols_stream = st.columns(len(cols))
+    for c, (label, value) in zip(cols_stream, cols):
+        c.metric(label, value)
+st.caption(f"As of (UTC): {as_of} • Window context: {int(window_hours)}h (if paramized in SQL)")
+
+# ---------- Charts ----------
+st.subheader("Volume by Chain & Version")
+if chain_col and version_col and vol_col:
+    grp = view.groupby([chain_col, version_col])[vol_col].sum().reset_index()
+    pivot = grp.pivot(index=chain_col, columns=version_col, values=vol_col).fillna(0)
+    st.bar_chart(pivot)
+else:
+    st.info("Need columns: chain, version, volume_usd")
+
+st.subheader("Top 10 Pools by Volume")
+pool_label = (
+    "pool_or_pair"
+    if "pool_or_pair" in view.columns
+    else ("token_symbol" if "token_symbol" in view.columns else ("pool" if "pool" in view.columns else None))
+)
+if pool_label and vol_col:
+    top = view.groupby(pool_label)[vol_col].sum().sort_values(ascending=False).head(10)
+    st.bar_chart(top)
+else:
+    st.info("Need columns: pool (or token_symbol) + volume_usd")
+
+# ---------- Raw Table ----------
+st.divider()
+st.subheader("Raw Table (full dataset)")
+st.dataframe(view, use_container_width=True)
