@@ -113,7 +113,7 @@ elif has_tx_from:
 else:
     kpi_traders = None  # unknown → don't show
 
-# ---------- Daily Digest (LLM) — FIRST, nicely formatted ----------
+# ---------- Daily Digest (LLM) ----------
 st.subheader("Daily Digest (LLM)")
 
 def fmt_usd(x):
@@ -139,7 +139,6 @@ def build_metrics_payload():
     if kpi_traders is not None:
         payload["totals"]["unique_traders"] = int(kpi_traders)
 
-    # by_chain_version (only if all needed cols present)
     if chain_col and version_col and vol_col:
         bc = (
             view.groupby([chain_col, version_col])[vol_col]
@@ -149,7 +148,6 @@ def build_metrics_payload():
         )
         payload["by_chain_version"] = bc
 
-    # top_pools (if pool label + vol exist)
     pool_label = "pool_or_pair" if "pool_or_pair" in view.columns else (
         "token_symbol" if "token_symbol" in view.columns else ("pool" if "pool" in view.columns else None)
     )
@@ -167,8 +165,7 @@ def build_metrics_payload():
     return payload
 
 def render_digest_md(d):
-    # Turn the structured digest into nice markdown (no code block)
-    headline = d.get("headline", "Uniswap activity update")
+    headline = d.get("headline", f"Uniswap activity update (last {int(window_hours)}h)")
     bullets  = d.get("bullets", [])
     watch    = d.get("watch_next", "")
     md = f"### {headline}\n\n"
@@ -184,8 +181,7 @@ def fallback_digest_md():
     if kpi_volume is not None:  totals.append(f"Volume: {fmt_usd(kpi_volume)}")
     if kpi_swaps is not None:   totals.append(f"Swaps: {kpi_swaps:,}")
     if kpi_traders is not None: totals.append(f"Unique traders: {kpi_traders:,}")
-    if totals:
-        parts.append("- " + " • ".join(totals))
+    if totals: parts.append("- " + " • ".join(totals))
     if chain_col and version_col and vol_col:
         parts.append("- See breakdown by chain/version below.")
     parts.append("- Top pools shown in the chart below.")
@@ -201,45 +197,26 @@ if use_llm and "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
         client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
         metrics = build_metrics_payload()
 
-        # Ask for STRUCTURED OUTPUT to keep it clean and consistent
-        schema = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "uniswap_digest",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "headline": {"type": "string"},
-                        "bullets":  {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4},
-                        "watch_next": {"type": "string"}
-                    },
-                    "required": ["headline", "bullets"],
-                    "additionalProperties": False
-                }
-            }
-        }
+        # Prefer Chat Completions with JSON mode (broad SDK compatibility)
+        system = (
+            "You are a product-minded analyst. Return ONLY JSON with keys: "
+            "headline (string), bullets (array of 2-4 strings), watch_next (string, optional). "
+            "Use ONLY the provided JSON metrics; do not invent numbers."
+        )
+        user = f"""Metrics JSON:
+{json.dumps(metrics)}"""
 
-        prompt = f"""You are a product-minded analyst. Using ONLY the JSON below, produce a short Uniswap digest for the last {int(window_hours)} hours.
-Return JSON with fields: headline, bullets (2–4 items), watch_next (optional).
-Keep it factual; do not invent numbers. Use units (USD, %, hours) where relevant.
-
-JSON:
-{json.dumps(metrics)}
-"""
-
-        resp = client.responses.create(
+        comp = client.chat.completions.create(
             model="gpt-4o-mini",
-            input=prompt,
-            response_format=schema
+            messages=[
+                {"role":"system","content": system},
+                {"role":"user","content": user}
+            ],
+            response_format={"type":"json_object"}
         )
 
-        # Parse the model's JSON output safely
-        dig = None
-        try:
-            dig = json.loads(resp.output_text)
-        except Exception:
-            pass
-
+        raw = comp.choices[0].message.content
+        dig = json.loads(raw) if raw else {}
         if isinstance(dig, dict):
             rendered_md = render_digest_md(dig)
         else:
@@ -249,7 +226,7 @@ JSON:
         st.warning(f"LLM disabled (error: {e}). Showing fallback.")
         rendered_md = fallback_digest_md()
 
-# Render the digest as normal markdown (NOT a code block)
+# Render the digest nicely (no code block)
 st.markdown(rendered_md)
 
 # ---------- KPI strip (only show what’s real) ----------
