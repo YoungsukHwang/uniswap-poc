@@ -48,7 +48,7 @@ def load_json(path: str) -> pd.DataFrame:
         return pd.DataFrame(data["rows"])
     return pd.DataFrame(data.get("rows", []))
 
-# ---------- Source selection ----------
+# ---------- Sidebar: source ----------
 st.sidebar.header("Data Source")
 mode = st.sidebar.radio("Choose source", ["Dune API", "Local JSON"], horizontal=True)
 json_path = st.sidebar.text_input("Local JSON path", value="metrics_24h.json")
@@ -79,99 +79,54 @@ if df.empty:
     st.warning("No data returned. Check your query/JSON.")
     st.stop()
 
-# Use full dataset
+# Use full dataset (no filters)
 view = df.copy()
 
 # ---------- Column detection ----------
 chain_col   = "chain" if "chain" in view.columns else None
 version_col = "version" if "version" in view.columns else None
 vol_col     = "volume_usd" if "volume_usd" in view.columns else None
+
+# Heuristics for swaps & traders:
+# - Prefer explicit aggregated columns if present (`swaps`, `unique_traders`)
+# - Else fall back to transaction-level dedup if available (`tx_hash`, `tx_from`)
+# - Else mark as None (do NOT show KPI if None)
 swaps_col   = "swaps" if "swaps" in view.columns else None
-tr_col      = "unique_traders" if "unique_traders" in view.columns else None
+traders_col = "unique_traders" if "unique_traders" in view.columns else None
+has_tx_hash = "tx_hash" in view.columns
+has_tx_from = "tx_from" in view.columns
 
-# ---------- KPIs ----------
-kpi_volume  = float(view[vol_col].sum()) if vol_col else 0.0
-kpi_swaps   = int(view[swaps_col].sum()) if swaps_col else len(view)
-kpi_traders = int(view[tr_col].sum()) if tr_col else (view["tx_from"].nunique() if "tx_from" in view else 0)
+# ---------- KPI computation (only when available) ----------
+kpi_volume = float(view[vol_col].sum()) if vol_col else None
 
-# ---------- Daily Digest (LLM) FIRST ----------
+if swaps_col:
+    kpi_swaps = int(pd.to_numeric(view[swaps_col], errors="coerce").fillna(0).sum())
+elif has_tx_hash:
+    kpi_swaps = int(view["tx_hash"].nunique())  # per-transaction dedup
+else:
+    kpi_swaps = None  # unknown → don't show
+
+if traders_col:
+    kpi_traders = int(pd.to_numeric(view[traders_col], errors="coerce").fillna(0).sum())
+elif has_tx_from:
+    kpi_traders = int(view["tx_from"].nunique())  # unique addresses
+else:
+    kpi_traders = None  # unknown → don't show
+
+# ---------- Daily Digest (LLM) — FIRST, nicely formatted ----------
 st.subheader("Daily Digest (LLM)")
 
-def fallback_digest():
-    return (
-        f"Headline: Uniswap activity update\n"
-        f"- Overall: volume ≈ ${kpi_volume:,.0f}; swaps ≈ {kpi_swaps:,}; unique traders ≈ {kpi_traders:,}\n"
-        f"- Notable chains/versions: see chart below\n"
-        f"- Top pools: see top-10 chart\n"
-        f"What to watch next: monitor unusual deltas vs prior window."
-    )
-
-use_llm = st.sidebar.checkbox("Use OpenAI (if key set)", value=True)
-if use_llm and "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
+def fmt_usd(x):
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-        metrics = {
-            "as_of_utc": as_of,
-            "window_hours": int(window_hours),
-            "totals": {"volume_usd": kpi_volume, "swaps": kpi_swaps, "unique_traders": kpi_traders},
-            "by_chain_version": (
-                view.groupby([chain_col, version_col])[vol_col].sum().reset_index().to_dict(orient="records")
-                if chain_col and version_col and vol_col else []
-            ),
-            "top_pools": (
-                view.groupby("pool_or_pair" if "pool_or_pair" in view.columns else pool_label)[vol_col]
-                .sum().reset_index().sort_values(vol_col, ascending=False).head(5).to_dict(orient="records")
-                if vol_col and ("pool_or_pair" in view.columns or "pool" in view.columns or "token_symbol" in view.columns) else []
-            ),
-        }
-        prompt = f"""
-You are a product-minded analyst. Using ONLY the JSON below, write a Uniswap digest for the last {{window_hours}} hours:
-- Headline (<= 15 words)
-- 3 bullets: (1) overall numbers/trends, (2) notable chains/versions, (3) top pools/movers
-- One “What to watch next” line
-Use units (USD, %, hours). Do not invent numbers.
-JSON:
-{json.dumps(metrics)}
-"""
-        resp = client.responses.create(model="gpt-4o-mini", input=prompt)
-        st.code(resp.output_text, language="markdown")
-    except Exception as e:
-        st.warning(f"LLM disabled (error: {e}). Showing fallback.")
-        st.code(fallback_digest(), language="markdown")
-else:
-    st.info("OpenAI key not set or disabled. Showing fallback.")
-    st.code(fallback_digest(), language="markdown")
+        x = float(x)
+        if x >= 1e9:  return f"${x/1e9:.2f}B"
+        if x >= 1e6:  return f"${x/1e6:.2f}M"
+        if x >= 1e3:  return f"${x/1e3:.2f}K"
+        return f"${x:,.0f}"
+    except Exception:
+        return "—"
 
-# ---------- KPIs after digest ----------
-c1, c2, c3 = st.columns(3)
-c1.metric("Volume (USD, window)", f"{kpi_volume:,.0f}")
-c2.metric("Swaps (window)", f"{kpi_swaps:,}")
-c3.metric("Unique traders (window)", f"{kpi_traders:,}")
-st.caption(f"As of (UTC): {as_of} • Window context: {int(window_hours)}h (if paramized in SQL)")
-
-# ---------- Charts ----------
-st.subheader("Volume by Chain & Version")
-if chain_col and version_col and vol_col:
-    grp = view.groupby([chain_col, version_col])[vol_col].sum().reset_index()
-    pivot = grp.pivot(index=chain_col, columns=version_col, values=vol_col).fillna(0)
-    st.bar_chart(pivot)
-else:
-    st.info("Need columns: chain, version, volume_usd")
-
-st.subheader("Top 10 Pools by Volume")
-pool_label = (
-    "pool_or_pair"
-    if "pool_or_pair" in view.columns
-    else ("token_symbol" if "token_symbol" in view.columns else ("pool" if "pool" in view.columns else None))
-)
-if pool_label and vol_col:
-    top = view.groupby(pool_label)[vol_col].sum().sort_values(ascending=False).head(10)
-    st.bar_chart(top)
-else:
-    st.info("Need columns: pool (or token_symbol) + volume_usd")
-
-# ---------- Raw Table ----------
-st.divider()
-st.subheader("Raw Table (full dataset)")
-st.dataframe(view, use_container_width=True)
+def build_metrics_payload():
+    payload = {
+        "as_of_utc": as_of,
+        "window_hours": int(windo_
