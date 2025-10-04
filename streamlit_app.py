@@ -15,7 +15,6 @@ st.set_page_config(page_title="Uniswap On-Chain Summarizer (POC)", layout="wide"
 st.title("Uniswap On-Chain Summarizer (POC)")
 
 # ---------- Config ----------
-WINDOW_DEFAULT = int(os.getenv("WINDOW_HOURS", "24"))
 Q_POOLS_ID    = int(os.getenv("DUNE_Q_POOLS_ID", "0"))
 Q_ACTIVITY_ID = int(os.getenv("DUNE_Q_ACTIVITY_ID", "0"))
 Q_VOLUME_ID   = int(os.getenv("DUNE_Q_VOLUME_ID", "0"))
@@ -23,7 +22,11 @@ Q_VOLUME_ID   = int(os.getenv("DUNE_Q_VOLUME_ID", "0"))
 # ---------- Sidebar ----------
 st.sidebar.header("Controls")
 mode = st.sidebar.radio("Source", ["Dune API", "Local JSON"], horizontal=True)
-window_hours = st.sidebar.number_input("Window (hours)", 1, 168, WINDOW_DEFAULT)
+
+# ✅ 드롭다운 + 버튼 방식
+window_hours = st.sidebar.selectbox("Window (hours)", [24, 48, 72, 168], index=0)
+run_query = st.sidebar.button("Update Data")
+
 json_pools    = st.sidebar.text_input("Local JSON (Q1 pools)", value="q1_pools.json")
 json_activity = st.sidebar.text_input("Local JSON (Q2 activity)", value="q2_activity.json")
 json_volume   = st.sidebar.text_input("Local JSON (Q3 volume)", value="q3_volume.json")
@@ -85,27 +88,32 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- Load data ----------
 as_of = datetime.now(timezone.utc).isoformat()
+df_pools, df_activity, df_volume = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-if mode == "Dune API":
-    if "DUNE_API_KEY" not in st.secrets:
-        st.error("Missing DUNE_API_KEY in Streamlit Secrets.")
-        st.stop()
-    try:
-        df_pools    = dune_df(Q_POOLS_ID, window_hours)    if Q_POOLS_ID else pd.DataFrame()
-        df_activity = dune_df(Q_ACTIVITY_ID, window_hours) if Q_ACTIVITY_ID else pd.DataFrame()
-        df_volume   = dune_df(Q_VOLUME_ID, window_hours)   if Q_VOLUME_ID else pd.DataFrame()
-    except Exception as e:
-        st.error(f"Dune API error: {e}")
+if run_query:   # ✅ 버튼 눌렀을 때만 실행
+    if mode == "Dune API":
+        if "DUNE_API_KEY" not in st.secrets:
+            st.error("Missing DUNE_API_KEY in Streamlit Secrets.")
+            st.stop()
+        try:
+            df_pools    = dune_df(Q_POOLS_ID, window_hours)    if Q_POOLS_ID else pd.DataFrame()
+            df_activity = dune_df(Q_ACTIVITY_ID, window_hours) if Q_ACTIVITY_ID else pd.DataFrame()
+            df_volume   = dune_df(Q_VOLUME_ID, window_hours)   if Q_VOLUME_ID else pd.DataFrame()
+        except Exception as e:
+            st.error(f"Dune API error: {e}")
+            st.stop()
+    else:
+        df_pools    = load_json(json_pools)
+        df_activity = load_json(json_activity)
+        df_volume   = load_json(json_volume)
+
+    df_pools, df_activity, df_volume = map(normalize, [df_pools, df_activity, df_volume])
+
+    if df_pools.empty and df_activity.empty and df_volume.empty:
+        st.warning("No data returned. Provide valid query IDs or JSONs.")
         st.stop()
 else:
-    df_pools    = load_json(json_pools)
-    df_activity = load_json(json_activity)
-    df_volume   = load_json(json_volume)
-
-df_pools, df_activity, df_volume = map(normalize, [df_pools, df_activity, df_volume])
-
-if df_pools.empty and df_activity.empty and df_volume.empty:
-    st.warning("No data returned. Provide valid query IDs or JSONs.")
+    st.info("👉 Select a window and click **Update Data** to fetch from Dune.")
     st.stop()
 
 # ---------- Metrics assembly ----------
