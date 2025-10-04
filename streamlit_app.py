@@ -45,8 +45,9 @@ def fmt_usd(x):
         return f"${x:,.0f}"
     except: return "—"
 
-@st.cache_data(ttl=15*60)
+@st.cache_data(ttl=30*60)  # 30분 캐시
 def dune_df(query_id: int, window_hours: int) -> pd.DataFrame:
+    """Run Dune query with window_hours param"""
     if not HAVE_DUNE:
         raise RuntimeError("Dune SDK not available")
     dune = DuneClient(api_key=st.secrets["DUNE_API_KEY"])
@@ -109,8 +110,9 @@ if run_query:   # ✅ 버튼 눌렀을 때만 실행
 
     df_pools, df_activity, df_volume = map(normalize, [df_pools, df_activity, df_volume])
 
+    # 🚨 방어: 큰 윈도우(168h)는 쿼리 느려질 수 있음
     if df_pools.empty and df_activity.empty and df_volume.empty:
-        st.warning("No data returned. Provide valid query IDs or JSONs.")
+        st.warning(f"⏳ Query still running or returned no data for {window_hours}h window. Try again in 1–2 minutes.")
         st.stop()
 else:
     st.info("👉 Select a window and click **Update Data** to fetch from Dune.")
@@ -158,12 +160,12 @@ if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
                 "swaps": total_swaps,
                 "unique_traders": total_traders,
             },
-            "by_chain_version": by_chain_version,
-            "top_pools": top_pools,
+            "by_chain_version": by_chain_version[:5],  # 상위 5개만
+            "top_pools": top_pools[:5] if top_pools else []
         }
         system = (
             "You are a product-minded analyst. "
-            "Summarize Uniswap’s last {window_hours}h activity from provided JSON. "
+            f"Summarize Uniswap’s last {window_hours}h activity from provided JSON. "
             "Give headline + 3 concise bullets + 1 'what to watch next'."
         )
         comp = client.chat.completions.create(
